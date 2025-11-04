@@ -37,6 +37,53 @@ const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
 
+const DB_NAME = '75DayChallenge';
+const STORE_NAME = 'media';
+
+const openDB = () => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+  });
+};
+
+const saveToIndexedDB = async (key, data) => {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction([STORE_NAME], 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.put(data, key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+};
+
+// ImgBB upload function
+const uploadToImgBB = async (base64Image) => {
+  const apiKey = 'b6b55f4969af635769cd98ca6fa4851d';
+
+  const formData = new FormData();
+  formData.append('image', base64Image.split(',')[1]);
+
+  const response = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
+    method: 'POST',
+    body: formData
+  });
+
+  const data = await response.json();
+  if (data.success) {
+    return data.data.url;
+  }
+  throw new Error('Upload failed');
+};
+
 // Firebase Service Functions
 const FirebaseService = {
   signIn: async (email, password) => {
@@ -103,11 +150,27 @@ const FirebaseService = {
   },
 
   saveCheckIn: async (userId, day, checkInData, photoBase64, videoBase64) => {
+    let photoUrl = null;
+
+    if (photoBase64) {
+      try {
+        photoUrl = await uploadToImgBB(photoBase64);
+      } catch (error) {
+        console.error('Photo upload failed:', error);
+        alert('Photo upload failed. Continuing without photo.');
+      }
+    }
+
+    // Videos stay local
+    if (videoBase64) {
+      await saveToIndexedDB(`${userId}_video_${day}`, videoBase64);
+    }
+
     await setDoc(doc(db, 'users', userId, 'checkIns', day.toString()), {
       ...checkInData,
-      photoUrl: photoBase64 || null,
+      photoUrl: photoUrl,
       photoIsPublic: false,
-      videoUrl: videoBase64 || null,
+      hasVideo: !!videoBase64,
       timestamp: serverTimestamp()
     });
 
@@ -215,21 +278,23 @@ const FirebaseService = {
     const photos = {};
     const videos = {};
 
-    checkInsSnap.forEach(doc => {
-      const data = doc.data();
-      checkIns[doc.id] = data;
+    checkInsSnap.forEach(docSnap => {
+      const data = docSnap.data();
+      checkIns[docSnap.id] = data;
 
+      // Load photos from Firestore (ImgBB URLs)
       if (data.photoUrl) {
-        photos[doc.id] = {
+        photos[docSnap.id] = {
           url: data.photoUrl,
           timestamp: data.timestamp,
           isPublic: data.photoIsPublic || false
         };
       }
 
-      if (data.videoUrl) {
-        videos[doc.id] = {
-          url: data.videoUrl,
+      // Videos are still local only (IndexedDB)
+      if (data.hasVideo) {
+        videos[docSnap.id] = {
+          hasVideo: true,
           timestamp: data.timestamp
         };
       }
@@ -408,7 +473,7 @@ const LoadingScreen = () => (
     fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif'
   }}>
     <div style={{ textAlign: 'center' }}>
-      <div style={{ fontSize: '48px', marginBottom: '16px' }}>💪</div>
+      <div style={{ fontSize: '48px', marginBottom: '16px' }}>⚠️</div>
       <div style={{ fontSize: '18px', color: '#8E8E93' }}>Loading...</div>
     </div>
   </div>
@@ -459,7 +524,22 @@ export default function App() {
   const loadUserData = async (userId) => {
     try {
       const data = await FirebaseService.getUserData(userId);
-      setUserData(data);
+
+      // If user data doesn't exist yet (new user), wait a moment and try again
+      if (!data) {
+        console.log('User data not found, retrying...');
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second
+        const retryData = await FirebaseService.getUserData(userId);
+
+        if (!retryData) {
+          console.error('User data still not found after retry');
+          setCurrentScreen('group');
+          return;
+        }
+        setUserData(retryData);
+      } else {
+        setUserData(data);
+      }
 
       if (data?.groupCode) {
         const group = await FirebaseService.getGroupData(data.groupCode);
@@ -478,6 +558,8 @@ export default function App() {
       }
     } catch (error) {
       console.error('Error loading user data:', error);
+      // If there's a permissions error, just go to group screen
+      setCurrentScreen('group');
     }
   };
 
@@ -608,13 +690,65 @@ export default function App() {
     const nextDay = (userData?.currentDay || 0) + 1;
     const allChecked = Object.values(todayCheckIn).every(v => v);
 
+    // Check if user already completed today's check-in
+    const lastCompletedDay = userData?.currentDay || 0;
     const now = new Date();
     const userDate = new Date(now.toLocaleString('en-US', { timeZone: userData?.timezone || 'UTC' }));
+    const today = userDate.toDateString();
+
+    // Get the timestamp of the last check-in
+    const lastCheckIn = userData?.checkIns?.[lastCompletedDay];
+    const lastCheckInDate = lastCheckIn?.timestamp?.seconds
+      ? new Date(lastCheckIn.timestamp.seconds * 1000).toLocaleString('en-US', { timeZone: userData?.timezone || 'UTC' })
+      : null;
+    const lastCheckInDateString = lastCheckInDate ? new Date(lastCheckInDate).toDateString() : null;
+
+    const alreadyCompletedToday = lastCheckInDateString === today;
+
     const midnight = new Date(userDate);
     midnight.setHours(24, 0, 0, 0);
     const hoursUntilMidnight = Math.floor((midnight - userDate) / (1000 * 60 * 60));
     const minutesUntilMidnight = Math.floor(((midnight - userDate) % (1000 * 60 * 60)) / (1000 * 60));
 
+    // If already completed today, show a message
+    if (alreadyCompletedToday) {
+      return (
+        <div style={{ minHeight: '100vh', backgroundColor: '#F2F2F7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif' }}>
+          <div style={{ maxWidth: '500px', margin: '0 auto', padding: '40px 20px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+              <h2 style={{ fontSize: '28px', fontWeight: '700', color: '#333' }}>Daily Check-In</h2>
+              <button onClick={() => setCurrentScreen('dashboard')} style={{ background: 'none', border: 'none', color: '#007AFF', fontSize: '16px', cursor: 'pointer' }}>
+                Back
+              </button>
+            </div>
+
+            <CupertinoCard style={{ textAlign: 'center', padding: '60px 40px', backgroundColor: '#34C759' }}>
+              <div style={{ fontSize: '72px', marginBottom: '20px' }}>✅</div>
+              <div style={{ fontSize: '24px', fontWeight: '700', color: 'white', marginBottom: '12px' }}>
+                Already Completed!
+              </div>
+              <div style={{ fontSize: '16px', color: 'white', opacity: 0.9, marginBottom: '20px' }}>
+                You've already completed Day {lastCompletedDay} today. Great work! 💪
+              </div>
+              <div style={{ fontSize: '14px', color: 'white', opacity: 0.8 }}>
+                Come back tomorrow for Day {nextDay}
+              </div>
+            </CupertinoCard>
+
+            <CupertinoCard style={{ backgroundColor: '#F2F2F7', textAlign: 'center' }}>
+              <div style={{ fontSize: '14px', color: '#8E8E93', marginBottom: '8px', fontWeight: '600' }}>⏰ NEXT CHECK-IN AVAILABLE IN</div>
+              <div style={{ fontSize: '32px', fontWeight: '700', color: '#007AFF' }}>{hoursUntilMidnight}h {minutesUntilMidnight}m</div>
+            </CupertinoCard>
+
+            <CupertinoButton fullWidth onClick={() => setCurrentScreen('dashboard')} style={{ marginTop: '20px' }}>
+              Back to Dashboard
+            </CupertinoButton>
+          </div>
+        </div>
+      );
+    }
+
+    // If not completed today, show the check-in form
     return (
       <div style={{ minHeight: '100vh', backgroundColor: '#F2F2F7', fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif' }}>
         <div style={{ maxWidth: '500px', margin: '0 auto', padding: '40px 20px' }}>
